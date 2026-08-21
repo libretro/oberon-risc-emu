@@ -6,6 +6,94 @@
 #include <errno.h>
 #include "disk.h"
 
+/* The disk image is the core's content, and on Android the frontend hands out
+   SAF content:// URIs that no C library can open - so when a VFS interface is
+   available every access to the image goes through it. Without one, and in the
+   standalone build, this is plain stdio exactly as before. */
+#ifdef __LIBRETRO__
+#include <libretro.h>
+
+static struct retro_vfs_interface *disk_vfs;
+
+void disk_set_vfs_interface(struct retro_vfs_interface *iface) {
+  disk_vfs = iface;
+}
+
+struct disk_file {
+  struct retro_vfs_file_handle *vfs;
+  FILE *stdio;
+};
+
+static struct disk_file *df_open(const char *path) {
+  struct disk_file *df = calloc(1, sizeof(*df));
+  if (!df) {
+    return NULL;
+  }
+  if (disk_vfs) {
+    df->vfs = disk_vfs->open(path,
+                             RETRO_VFS_FILE_ACCESS_READ_WRITE |
+                             RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING,
+                             RETRO_VFS_FILE_ACCESS_HINT_NONE);
+    if (df->vfs) {
+      return df;
+    }
+  }
+  df->stdio = fopen(path, "rb+");
+  if (!df->stdio) {
+    free(df);
+    return NULL;
+  }
+  return df;
+}
+
+static void df_seek(struct disk_file *df, int64_t offset) {
+  if (!df) return;
+  if (df->vfs) disk_vfs->seek(df->vfs, offset, RETRO_VFS_SEEK_POSITION_START);
+  else fseek(df->stdio, (long)offset, SEEK_SET);
+}
+
+static void df_read(struct disk_file *df, void *buf, size_t len) {
+  if (!df) return;
+  if (df->vfs) disk_vfs->read(df->vfs, buf, len);
+  else fread(buf, len, 1, df->stdio);
+}
+
+static void df_write(struct disk_file *df, const void *buf, size_t len) {
+  if (!df) return;
+  if (df->vfs) disk_vfs->write(df->vfs, buf, len);
+  else fwrite(buf, len, 1, df->stdio);
+}
+#else
+struct disk_file {
+  FILE *stdio;
+};
+
+static struct disk_file *df_open(const char *path) {
+  struct disk_file *df = calloc(1, sizeof(*df));
+  if (!df) {
+    return NULL;
+  }
+  df->stdio = fopen(path, "rb+");
+  if (!df->stdio) {
+    free(df);
+    return NULL;
+  }
+  return df;
+}
+
+static void df_seek(struct disk_file *df, int64_t offset) {
+  if (df) fseek(df->stdio, (long)offset, SEEK_SET);
+}
+
+static void df_read(struct disk_file *df, void *buf, size_t len) {
+  if (df) fread(buf, len, 1, df->stdio);
+}
+
+static void df_write(struct disk_file *df, const void *buf, size_t len) {
+  if (df) fwrite(buf, len, 1, df->stdio);
+}
+#endif
+
 enum DiskState {
   diskCommand,
   diskRead,
@@ -17,7 +105,7 @@ struct Disk {
   struct RISC_SPI spi;
 
   enum DiskState state;
-  FILE *file;
+  struct disk_file *file;
   uint32_t offset;
 
   uint32_t rx_buf[128];
@@ -32,9 +120,9 @@ struct Disk {
 static uint32_t disk_read(const struct RISC_SPI *spi);
 static void disk_write(const struct RISC_SPI *spi, uint32_t value);
 static void disk_run_command(struct Disk *disk);
-static void seek_sector(FILE *f, uint32_t secnum);
-static void read_sector(FILE *f, uint32_t buf[static 128]);
-static void write_sector(FILE *f, uint32_t buf[static 128]);
+static void seek_sector(struct disk_file *f, uint32_t secnum);
+static void read_sector(struct disk_file *f, uint32_t buf[static 128]);
+static void write_sector(struct disk_file *f, uint32_t buf[static 128]);
 
 
 struct RISC_SPI *disk_new(const char *filename) {
@@ -47,10 +135,17 @@ struct RISC_SPI *disk_new(const char *filename) {
   disk->state = diskCommand;
 
   if (filename) {
-    disk->file = fopen(filename, "rb+");
+    disk->file = df_open(filename);
     if (disk->file == 0) {
       fprintf(stderr, "Can't open file \"%s\": %s\n", filename, strerror(errno));
+#ifdef __LIBRETRO__
+      /* A core must not take the frontend down with it - report the failure to
+         the caller instead, which turns into a refused retro_load_game. */
+      free(disk);
+      return NULL;
+#else
       exit(1);
+#endif
     }
 
     // Check for filesystem-only image, starting directly at sector 1 (DiskAdr 29)
@@ -154,17 +249,13 @@ static void disk_run_command(struct Disk *disk) {
   disk->tx_idx = -1;
 }
 
-static void seek_sector(FILE *f, uint32_t secnum) {
-  if (f) {
-    fseek(f, secnum * 512, SEEK_SET);
-  }
+static void seek_sector(struct disk_file *f, uint32_t secnum) {
+  df_seek(f, (int64_t)secnum * 512);
 }
 
-static void read_sector(FILE *f, uint32_t buf[static 128]) {
+static void read_sector(struct disk_file *f, uint32_t buf[static 128]) {
   uint8_t bytes[512] = { 0 };
-  if (f) {
-    fread(bytes, 512, 1, f);
-  }
+  df_read(f, bytes, 512);
   for (int i = 0; i < 128; i++) {
     buf[i] = (uint32_t)bytes[i*4+0]
       | ((uint32_t)bytes[i*4+1] << 8)
@@ -173,15 +264,16 @@ static void read_sector(FILE *f, uint32_t buf[static 128]) {
   }
 }
 
-static void write_sector(FILE *f, uint32_t buf[static 128]) {
-  if (f) {
-    uint8_t bytes[512];
-    for (int i = 0; i < 128; i++) {
-      bytes[i*4+0] = (uint8_t)(buf[i]      );
-      bytes[i*4+1] = (uint8_t)(buf[i] >>  8);
-      bytes[i*4+2] = (uint8_t)(buf[i] >> 16);
-      bytes[i*4+3] = (uint8_t)(buf[i] >> 24);
-    }
-    fwrite(bytes, 512, 1, f);
+static void write_sector(struct disk_file *f, uint32_t buf[static 128]) {
+  uint8_t bytes[512];
+  if (!f) {
+    return;
   }
+  for (int i = 0; i < 128; i++) {
+    bytes[i*4+0] = (uint8_t)(buf[i]      );
+    bytes[i*4+1] = (uint8_t)(buf[i] >>  8);
+    bytes[i*4+2] = (uint8_t)(buf[i] >> 16);
+    bytes[i*4+3] = (uint8_t)(buf[i] >> 24);
+  }
+  df_write(f, bytes, 512);
 }

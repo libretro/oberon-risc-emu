@@ -1,4 +1,4 @@
-INCFLAGS := -I$(CORE_DIR)/src
+INCFLAGS := -I$(CORE_DIR)/src -I$(CORE_DIR)/Libretro
 
 SOURCES_C := \
 	$(CORE_DIR)/Libretro/libretro.c \

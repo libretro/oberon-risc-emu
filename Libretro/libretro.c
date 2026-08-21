@@ -147,8 +147,18 @@ static const struct retro_controller_info ports[] = {
 };
 
 void retro_set_environment(retro_environment_t cb) {
+	struct retro_vfs_interface_info vfs_iface_info;
+
 	_environ_cb = cb;
 	_environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
+
+	/* Take the frontend's VFS when it offers one and let the disk image be
+	   opened through it. This core is need_fullpath, so on Android it is handed
+	   a SAF content:// URI that stdio cannot open. */
+	vfs_iface_info.required_interface_version = 1;
+	vfs_iface_info.iface                      = NULL;
+	if (_environ_cb(RETRO_ENVIRONMENT_GET_VFS_INTERFACE, &vfs_iface_info))
+		disk_set_vfs_interface(vfs_iface_info.iface);
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb) {
@@ -206,8 +216,11 @@ bool retro_load_game(const struct retro_game_info *game)
 		return false;
 	}
 
-	if (game->path)
+	if (game->path) {
 		_spi_disk = disk_new(game->path);
+		if (!_spi_disk)
+			return false;
+	}
 	if (!_spi_disk) {
 		_log_cb(RETRO_LOG_ERROR, "failed to load disk image\n");
 		return false;
